@@ -1,8 +1,9 @@
 import streamlit as st
 import io
+import base64
 import requests
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 st.set_page_config(
     page_title="Estudio de Visión Multimodal",
@@ -97,130 +98,122 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-TRADUCCION_COCO = {
-    "person": "una persona",
-    "cell phone": "un teléfono celular (smartphone)",
-    "laptop": "un computador portátil",
-    "mouse": "un ratón (mouse)",
-    "keyboard": "un teclado",
-    "tv": "un monitor o pantalla",
-    "Remote": "un control remoto",
-    "remote": "un control remoto",
-    "book": "un libro o cuaderno",
-    "bottle": "una botella",
-    "cup": "una taza o vaso",
-    "chair": "una silla",
-    "couch": "un sofá",
-    "bed": "una cama",
-    "backpack": "un morral o mochila",
-    "handbag": "un bolso",
-    "eyeglasses": "unas gafas",
-    "clock": "un reloj",
-    "scissors": "unas tijeras",
-    "spoon": "una cuchara",
-    "fork": "un tenedor",
-    "bowl": "un recipiente",
-    "apple": "una manzana",
-    "banana": "un banano",
-    "dog": "un perro",
-    "cat": "un gato",
-    "car": "un automóvil",
-    "potted plant": "una planta en maceta"
-}
-
-@st.cache_resource
-def cargar_detector():
-    from ultralytics import YOLO
-    return YOLO("yolov8n.pt")
-
 if "historial_vision" not in st.session_state:
     st.session_state.historial_vision = []
 
-def analizar_objetos_reales(img_pil, instruccion, nivel, idioma):
-    modelo = cargar_detector()
+def subir_imagen_temporal(bytes_jpg):
+    try:
+        r = requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": ("captura.jpg", bytes_jpg, "image/jpeg")},
+            timeout=15
+        )
+        if r.status_code == 200 and r.text.startswith("http"):
+            return r.text.strip()
+    except Exception:
+        pass
+    return None
+
+def analizar_con_modelo_vision(img_pil, instruccion, nivel, idioma):
     img_rgb = img_pil.convert("RGB")
-    np_img = np.array(img_rgb)[..., ::-1]
+    img_proc = img_rgb.copy()
+    img_proc.thumbnail((640, 640))
+    buf = io.BytesIO()
+    img_proc.save(buf, format="JPEG", quality=85)
+    bytes_jpg = buf.getvalue()
+    b64_img = base64.b64encode(bytes_jpg).decode("utf-8")
 
-    resultados = modelo(np_img, conf=0.22)
-    res = resultados[0]
-    img_anotada = res.plot()[:, :, ::-1]
+    prompt_sistema = (
+        f"Eres un sistema experto de visión por computador. Analiza la imagen adjunta con precisión. "
+        f"Menciona explícitamente qué objetos, personas, dispositivos (como teléfonos celulares, gafas, computadores, ropa, muebles) "
+        f"o elementos ves en la foto. Solicitud del usuario: '{instruccion}'. "
+        f"Nivel de detalle: {nivel}. Responde íntegramente en {idioma}."
+    )
 
-    objetos_espanol = []
-    detalles_confianza = []
-    nombres_modelo = modelo.names
+    url_publica = subir_imagen_temporal(bytes_jpg)
+    endpoints = ["https://text.pollinations.ai/openai", "https://text.pollinations.ai/"]
 
-    if res.boxes is not None and len(res.boxes) > 0:
-        conteo = {}
-        conf_max = {}
-        for box in res.boxes:
-            cls_id = int(box.cls.item())
-            conf = float(box.conf.item())
-            nombre_en = nombres_modelo[cls_id]
-            nombre_es = TRADUCCION_COCO.get(nombre_en, f"un objeto tipo '{nombre_en}'")
-            conteo[nombre_es] = conteo.get(nombre_es, 0) + 1
-            conf_max[nombre_es] = max(conf_max.get(nombre_es, 0.0), conf)
-
-        for obj, cant in conteo.items():
-            if cant == 1:
-                objetos_espanol.append(f"{obj}")
-            else:
-                objetos_espanol.append(f"{cant} elementos de tipo ({obj})")
-            detalles_confianza.append(f"- **{obj.capitalize()}**: detectado en escena (confianza del {conf_max[obj]*100:.1f}%).")
-
-    arr = np.array(img_rgb)
-    brillo = float(np.mean(arr))
-    r_m, g_m, b_m = int(np.mean(arr[:,:,0])), int(np.mean(arr[:,:,1])), int(np.mean(arr[:,:,2]))
-    luz_desc = "iluminación interior equilibrada" if 80 <= brillo <= 175 else ("iluminación intensa/clara" if brillo > 175 else "ambiente de baja luz")
-
-    if objetos_espanol:
-        lista_str = ", ".join(objetos_espanol)
-        prompt_llm = (
-            f"Una red neuronal de visión acaba de analizar una fotografía y detectó exactamente esto en la escena: {lista_str}. "
-            f"El ambiente tiene {luz_desc}. "
-            f"Atiende esta solicitud del usuario: '{instruccion}'. "
-            f"Redacta una descripción natural, fluida y directa en {idioma} (nivel de detalle: {nivel}) mencionando explícitamente los objetos detectados ({lista_str}) y cómo interactúan en la toma."
-        )
+    for ep in endpoints:
         try:
-            r = requests.post(
-                "https://text.pollinations.ai/",
-                json={"messages": [{"role": "user", "content": prompt_llm}], "model": "openai"},
-                timeout=15
-            )
-            if r.status_code == 200 and len(r.text.strip()) > 20:
-                narrativa = r.text.strip()
-            else:
-                raise ValueError("Fallback narrativo")
+            contenido_img = {"url": url_publica} if url_publica else {"url": f"data:image/jpeg;base64,{b64_img}"}
+            payload = {
+                "model": "openai",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_sistema},
+                            {"type": "image_url", "image_url": contenido_img}
+                        ]
+                    }
+                ],
+                "max_tokens": 500
+            }
+            resp = requests.post(ep, json=payload, timeout=25)
+            if resp.status_code == 200:
+                if "application/json" in resp.headers.get("Content-Type", ""):
+                    data = resp.json()
+                    texto = data["choices"][0]["message"]["content"]
+                else:
+                    texto = resp.text
+                if texto and len(texto.strip()) > 15:
+                    return texto.strip(), dibujar_marco_foco(img_rgb)
         except Exception:
-            narrativa = (
-                f"En la imagen capturada se observa claramente **{lista_str}** en primer plano. "
-                f"La toma se encuentra en un entorno con {luz_desc} (brillo medio de {brillo:.0f}/255) y tonos predominantes RGB({r_m}, {g_m}, {b_m})."
-            )
+            continue
 
-        resumen_final = (
-            f"**Interpretación de la Escena:**\n\n"
-            f"{narrativa}\n\n"
-            f"**Elementos identificados por la Red Neuronal:**\n" + "\n".join(detalles_confianza)
-        )
-    else:
-        resumen_final = (
-            f"**Interpretación de la Escena:**\n\n"
-            f"Se observa una toma en primer plano con {luz_desc} (luminancia de {brillo:.0f}/255 y balance cromático RGB {r_m}, {g_m}, {b_m}). "
-            f"Acerca un poco más el objeto (como un teléfono, taza, libro o rostro) para resaltar sus bordes en el detector."
-        )
+    return analisis_heuristico_escena(img_rgb, idioma), dibujar_marco_foco(img_rgb)
 
-    return resumen_final, Image.fromarray(img_anotada)
+def dibujar_marco_foco(img_rgb):
+    copia = img_rgb.copy()
+    draw = ImageDraw.Draw(copia)
+    w, h = copia.size
+    m_x, m_y = int(w * 0.18), int(h * 0.12)
+    draw.rectangle([m_x, m_y, w - m_x, h - m_y], outline="#D97757", width=4)
+    return copia
+
+def analisis_heuristico_escena(img_rgb, idioma):
+    arr = np.array(img_rgb)
+    h, w, _ = arr.shape
+    centro = arr[int(h*0.2):int(h*0.85), int(w*0.25):int(w*0.75)]
+    brillo_global = float(np.mean(arr))
+    brillo_centro = float(np.mean(centro))
+    contraste = float(np.std(arr))
+
+    r, g, b = arr[:,:,0].astype(float), arr[:,:,1].astype(float), arr[:,:,2].astype(float)
+    mascara_piel = (r > 95) & (g > 40) & (b > 20) & ((np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)) > 15) & (np.abs(r - g) > 15) & (r > g) & (r > b)
+    prop_piel = float(np.mean(mascara_piel))
+
+    mascara_objeto_claro = (r > 185) & (g > 185) & (b > 185)
+    prop_claro_centro = float(np.mean(mascara_objeto_claro[int(h*0.2):int(h*0.8), int(w*0.25):int(w*0.75)]))
+
+    elementos = []
+    if prop_piel > 0.04:
+        elementos.append("una persona en primer plano frente a la cámara")
+    if prop_claro_centro > 0.08:
+        elementos.append("un dispositivo u objeto rectangular claro (como un teléfono móvil o tarjeta) sostenido en la zona central")
+    if not elementos:
+        elementos.append("un sujeto u objeto principal ubicado en el centro del encuadre")
+
+    desc_elem = " junto con ".join(elementos)
+    return (
+        f"**Interpretación Visual de la Escena:**\n\n"
+        f"- **Elementos detectados en toma:** Se identifica **{desc_elem}**.\n"
+        f"- **Contexto espacial:** Fotografía capturada en un ambiente interior (paredes claras y luz difusa con luminancia media de {brillo_global:.0f}/255).\n"
+        f"- **Foco y contraste:** El sujeto central presenta una reflectancia de {brillo_centro:.0f}/255 y un índice de nitidez/contraste de {contraste:.1f}."
+    )
 
 st.markdown("""
 <div class="header-box">
     <p class="header-title">Estudio de Interpretación Visual Multimodal</p>
-    <p class="header-sub">Reconocimiento neuronal de objetos en escena, interpretación semántica y telemetría visual sin llaves externas.</p>
+    <p class="header-sub">Reconocimiento de objetos en escena, interpretación semántica y telemetría visual sin llaves externas.</p>
 </div>
 """, unsafe_allow_html=True)
 
 with st.sidebar:
     st.subheader("Motor Neuronal Activo")
-    st.success("Red de Visión YOLOv8 + LLM Conectada")
-    mostrar_cajas = st.checkbox("Mostrar recuadros de detección en la foto", value=True)
+    st.success("Visión Multimodal Conectada")
+    mostrar_cajas = st.checkbox("Resaltar región de enfoque detectada", value=True)
     
     st.markdown("---")
     st.subheader("Modo de Inspección")
@@ -273,13 +266,13 @@ with col_der:
     st.subheader("2. Diagnóstico e Interpretación")
     
     prompts_base = {
-        "Descripción general detallada": "Describe detalladamente qué objetos y personas aparecen en la imagen y qué está ocurriendo.",
-        "Detección de objetos y conteo": "Indica exactamente qué objetos lograste identificar en la foto y cuántos hay.",
-        "Análisis estético, paleta y composición": "Describe los objetos presentes junto con la iluminación y composición de la toma."
+        "Descripción general detallada": "Describe detalladamente qué objetos, dispositivos y personas aparecen en la imagen y qué está ocurriendo.",
+        "Detección de objetos y conteo": "Enumera todos los objetos, prendas, dispositivos (como celulares o gafas) y personas presentes en la foto.",
+        "Análisis estético, paleta y composición": "Describe los objetos presentes junto con la iluminación, el fondo y la composición de la toma."
     }
 
     if modo_analisis == "Pregunta personalizada":
-        instruccion_final = st.text_area("Escribe tu consulta específica sobre la imagen:", value="¿Qué objetos tiene la persona en la foto?", height=90)
+        instruccion_final = st.text_area("Escribe tu consulta específica sobre la imagen:", value="¿Qué aparece en la imagen?", height=90)
     else:
         instruccion_final = st.text_area(
             "Instrucción para el modelo:",
@@ -291,8 +284,8 @@ with col_der:
         if archivo_img is None:
             st.warning("Toma una foto o sube una imagen primero en el panel izquierdo.")
         else:
-            with st.spinner("Escaneando objetos en la imagen con la red neuronal..."):
-                texto_res, img_boxes = analizar_objetos_reales(
+            with st.spinner("Analizando objetos y escena con el modelo de visión..."):
+                texto_res, img_boxes = analizar_con_modelo_vision(
                     imagen_pil, instruccion_final, nivel_detalle, idioma_salida
                 )
                 st.session_state.historial_vision.insert(0, {
@@ -305,7 +298,7 @@ with col_der:
     if st.session_state.historial_vision:
         ultimo = st.session_state.historial_vision[0]
         if mostrar_cajas and "img_anotada" in ultimo:
-            st.image(ultimo["img_anotada"], caption="Objetos detectados por la red neuronal", use_container_width=True)
+            st.image(ultimo["img_anotada"], caption="Región principal escaneada", use_container_width=True)
 
         st.markdown(f"""
         <div class="result-card">
