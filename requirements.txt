@@ -1,4 +1,6 @@
 streamlit
+ultralytics
+torch
 requests
 Pillow
 numpy
